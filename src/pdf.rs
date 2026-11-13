@@ -1,5 +1,5 @@
 use crate::model::Rect;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ unsafe extern "C" {
     fn pdf_count(doc: *mut c_void) -> i32;
     fn pdf_release(object: *mut c_void);
     fn pdf_page(doc: *mut c_void, index: i32, size: *mut f64) -> *mut c_void;
+    fn pdf_page_text(page: *mut c_void) -> *mut c_char;
     fn pdf_text(page: *mut c_void, count: *mut u32) -> *mut [f64; 4];
     fn pdf_free(data: *mut c_void);
     fn pdf_render(page: *mut c_void, rotation: i32, width: i32, height: i32, data: *mut u8) -> i32;
@@ -59,6 +60,22 @@ impl Document {
         (0..count as u32)
             .map(|i| self.page(i).map(|(_, size)| size))
             .collect()
+    }
+
+    pub fn title(&self, index: u32) -> Result<Option<String>, String> {
+        let (page, _) = self.page(index)?;
+        let text = unsafe { pdf_page_text(page.0.as_ptr()) };
+        let Some(text) = NonNull::new(text) else {
+            return Ok(None);
+        };
+        let title = unsafe { CStr::from_ptr(text.as_ptr()) }
+            .to_string_lossy()
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned);
+        unsafe { pdf_free(text.as_ptr().cast()) };
+        Ok(title)
     }
 
     pub fn render(&self, index: u32, rotation: u8, edge: u32) -> Result<Preview, String> {

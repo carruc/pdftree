@@ -2,7 +2,10 @@ mod model;
 mod pdf;
 mod store;
 
-use model::{Drop as Destination, Id, Note, Page, Project, Rect, rotate_rect};
+use model::{
+    BranchPosition, Drop as Destination, Highlight, HighlightColor, Id, Note, Page, Project, Rect,
+    rotate_rect,
+};
 use rune::{App, AppHandle, AppSpec, Cx, FileDialogOptions, Key, TextEdit, Tx};
 use std::{
     cell::RefCell,
@@ -21,6 +24,7 @@ const HISTORY_LIMIT: usize = 40;
 enum Tool {
     Select,
     Hand,
+    Reposition,
     Highlight,
     Note,
 }
@@ -32,10 +36,11 @@ enum Import {
     Replace(Id),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Next {
     OpenPdf,
     OpenProject,
+    OpenRecent(PathBuf),
     Quit,
 }
 
@@ -46,9 +51,12 @@ enum Prompt {
         bytes: Arc<[u8]>,
         sizes: Vec<[f32; 2]>,
     },
+    TextNode(Option<Id>),
+    Group(Id),
+    HighlightColor,
     Note {
         id: Option<Id>,
-        position: [f32; 2],
+        node: Option<Id>,
     },
 }
 
@@ -69,12 +77,19 @@ struct Cache {
     pending: BTreeSet<PreviewKey>,
     entries: BTreeMap<PreviewKey, Result<Preview, String>>,
     order: VecDeque<PreviewKey>,
+    pending_titles: BTreeSet<(Id, u32)>,
+    titles: BTreeMap<(Id, u32), Option<String>>,
 }
 
 enum Job {
     Import {
         path: PathBuf,
         action: Import,
+        generation: u64,
+    },
+    Title {
+        page: (Id, u32),
+        bytes: Arc<[u8]>,
         generation: u64,
     },
     Render {
@@ -84,22 +99,32 @@ enum Job {
     },
 }
 
+#[derive(Clone, Copy)]
+struct RepositionDrag {
+    node: Id,
+    initial: BranchPosition,
+    position: BranchPosition,
+}
+
 struct State {
     project: Project,
     saved: Project,
     history: VecDeque<Project>,
     redo: Vec<Project>,
     path: Option<PathBuf>,
+    recent_projects: Vec<PathBuf>,
     view: Viewport,
     canvas: Rect,
     canvas_drag_delta: [f32; 2],
     tool: Tool,
+    graph_mode: bool,
+    highlight_color: HighlightColor,
     selected: BTreeSet<Id>,
     anchor: Option<Id>,
     drag: Option<Id>,
+    reposition: Option<RepositionDrag>,
     drop: Option<Destination>,
     selection: Option<(Id, [f32; 2], Vec<Rect>)>,
-    note_drag: Option<(Id, [f32; 2])>,
     prompt: Option<Prompt>,
     draft: TextEdit,
     status: String,
@@ -122,16 +147,19 @@ impl State {
             history: VecDeque::new(),
             redo: vec![],
             path: None,
+            recent_projects: store::recent_projects(),
             view: Viewport::default(),
             canvas: [0.0, 90.0, 1100.0, 650.0],
             canvas_drag_delta: [0.0; 2],
             tool: Tool::Select,
+            graph_mode: false,
+            highlight_color: HighlightColor::default(),
             selected: BTreeSet::new(),
             anchor: None,
             drag: None,
+            reposition: None,
             drop: None,
             selection: None,
-            note_drag: None,
             prompt: None,
             draft: TextEdit::default(),
             status: String::new(),
@@ -142,6 +170,8 @@ impl State {
                 pending: BTreeSet::new(),
                 entries: BTreeMap::new(),
                 order: VecDeque::new(),
+                pending_titles: BTreeSet::new(),
+                titles: BTreeMap::new(),
             }),
             jobs,
             app,
@@ -163,6 +193,7 @@ impl State {
     }
 
     fn history(&mut self, redo: bool) {
+        self.reposition = None;
         if redo {
             if let Some(project) = self.redo.pop() {
                 self.history
@@ -184,6 +215,55 @@ impl State {
         cache.entries.clear();
         cache.pending.clear();
         cache.order.clear();
+        cache.pending_titles.clear();
+        cache.titles.clear();
+    }
+
+    fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.selection = None;
+        self.reposition = None;
+        self.status.clear();
+    }
+
+    fn toggle_reposition(&mut self) {
+        let tool = if self.tool == Tool::Reposition {
+            Tool::Select
+        } else {
+            Tool::Reposition
+        };
+        self.set_tool(tool);
+    }
+
+    fn add_blank_page(&mut self) {
+        self.edit(|p| {
+            p.tree.add(Page::new(None, [595.0, 842.0]));
+        });
+    }
+
+    fn replace_page(&mut self, tx: &mut Tx) {
+        if self.selected.len() == 1
+            && let Some(&id) = self.selected.first()
+            && self.project.tree.pages[&id].text.is_none()
+        {
+            self.pick_pdf(Import::Replace(id), tx);
+        }
+    }
+
+    fn group_editor(&mut self) {
+        if let Some(id) = self.group_root() {
+            self.prompt = Some(Prompt::Group(id));
+        }
+    }
+
+    fn highlight_color_picker(&mut self) {
+        if self.tool == Tool::Highlight {
+            self.prompt = Some(Prompt::HighlightColor);
+        }
+    }
+
+    fn zoom_center(&mut self, factor: f32) {
+        self.zoom(factor, [self.canvas[2] * 0.5, self.canvas[3] * 0.5]);
     }
 
     fn reset(&mut self, project: Project, path: Option<PathBuf>, view: Viewport) {
@@ -191,7 +271,7 @@ impl State {
         self.project = project;
         self.path = path;
         self.view = view;
-        self.tool = Tool::Select;
+        self.set_tool(Tool::Select);
         self.selected.clear();
         self.anchor = None;
         self.history.clear();
@@ -211,6 +291,7 @@ impl State {
         match next {
             Next::Quit => tx.quit(),
             Next::OpenPdf => self.pick_pdf(Import::Open, tx),
+            Next::OpenRecent(path) => self.open_project(path),
             Next::OpenProject => {
                 self.choosing_file = true;
                 tx.open_file(
@@ -218,19 +299,35 @@ impl State {
                     |s: &mut Self, answer, _| {
                         s.choosing_file = false;
                         match answer {
-                            Ok(Some(path)) => match store::load(&path) {
-                                Ok((project, view)) => {
-                                    s.reset(project, Some(path), view);
-                                    s.status = "Project opened.".into();
-                                }
-                                Err(error) => s.status = error.to_string(),
-                            },
+                            Ok(Some(path)) => s.open_project(path),
                             Ok(None) => {}
                             Err(error) => s.status = error.to_string(),
                         }
                     },
                 );
             }
+        }
+    }
+
+    fn open_project(&mut self, path: PathBuf) {
+        match store::load(&path) {
+            Ok((project, view)) => {
+                self.remember_project(&path);
+                self.reset(project, Some(path), view);
+                self.status = "Project opened.".into();
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn remember_project(&mut self, path: &std::path::Path) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.recent_projects
+            .retain(|recent| recent != &path && recent.is_file());
+        self.recent_projects.insert(0, path);
+        self.recent_projects.truncate(store::RECENT_LIMIT);
+        if let Err(error) = store::save_recent_projects(&self.recent_projects) {
+            eprintln!("Could not save recent projects: {error}");
         }
     }
 
@@ -260,6 +357,7 @@ impl State {
     fn save_to(&mut self, path: PathBuf, tx: &mut Tx, next: Option<Next>) {
         match store::save(&path, &self.project, self.view) {
             Ok(()) => {
+                self.remember_project(&path);
                 self.path = Some(path);
                 self.saved = self.project.clone();
                 self.status = "Project saved.".into();
@@ -311,10 +409,13 @@ impl State {
         if matches!(action, Import::Open) {
             let mut project = Project::default();
             let source = project.source(bytes);
+            let mut parent = None;
             for &index in &pages {
-                project
-                    .tree
-                    .add(Page::new(Some((source, index as u32)), sizes[index]));
+                let page = Page::new(Some((source, index as u32)), sizes[index]);
+                parent = Some(match parent {
+                    Some(id) => project.tree.append_child(id, page),
+                    None => project.tree.add(page),
+                });
             }
             self.reset(project, None, Viewport::default());
             self.saved = Project::default();
@@ -345,10 +446,44 @@ impl State {
         };
     }
 
-    fn note_editor(&mut self, id: Option<Id>, position: [f32; 2]) {
+    fn note_editor(&mut self, id: Option<Id>, node: Option<Id>) {
         self.status.clear();
         self.draft = TextEdit::new(id.map_or("", |id| &self.project.tree.notes[&id].text));
-        self.prompt = Some(Prompt::Note { id, position });
+        self.prompt = Some(Prompt::Note { id, node });
+    }
+
+    fn group_root(&self) -> Option<Id> {
+        let id = self.anchor.filter(|id| self.selected.contains(id))?;
+        let descendants = self.project.tree.descendants(id);
+        (self.selected.len() == 1
+            || (self.selected.len() == descendants.len() + 1
+                && descendants.is_subset(&self.selected)))
+        .then_some(id)
+    }
+
+    fn set_group(&mut self, id: Id, color: Option<u8>) {
+        self.edit(|p| p.tree.pages.get_mut(&id).unwrap().group = color);
+        self.prompt = None;
+    }
+
+    fn sticky_editor(&mut self, node: Id) {
+        let existing = self
+            .project
+            .tree
+            .notes
+            .iter()
+            .find(|(_, note)| note.node == Some(node))
+            .map(|(&id, _)| id);
+        self.note_editor(existing, Some(node));
+    }
+
+    fn text_node_editor(&mut self, id: Option<Id>) {
+        self.status.clear();
+        self.draft = TextEdit::new(
+            id.and_then(|id| self.project.tree.pages[&id].text.as_deref())
+                .unwrap_or_default(),
+        );
+        self.prompt = Some(Prompt::TextNode(id));
     }
 
     fn apply_prompt(&mut self) {
@@ -374,12 +509,48 @@ impl State {
                     }
                 }
             }
-            Some(Prompt::Note { id, position }) => {
+            Some(Prompt::TextNode(id)) => {
+                let text = self.draft.text.trim().to_owned();
+                if text.is_empty() {
+                    self.status = "Enter some text for this node.".into();
+                    self.prompt = Some(Prompt::TextNode(id));
+                    return;
+                }
+                let mut node = id;
+                self.edit(|project| {
+                    let id = *node
+                        .get_or_insert_with(|| project.tree.add(Page::new(None, [276.0, 120.0])));
+                    project.tree.pages.get_mut(&id).unwrap().text = Some(text);
+                });
+                self.tool = Tool::Select;
+                self.selected = BTreeSet::from([node.unwrap()]);
+                self.anchor = node;
+                ui::reveal_root_move(self);
+            }
+            Some(Prompt::Note { id, node }) => {
                 let text = self.draft.text.trim().to_owned();
                 if !text.is_empty() {
+                    let canvas = self.canvas;
+                    let view = self.view;
                     self.edit(|project| {
                         let id = id.unwrap_or_else(|| project.tree.id());
-                        project.tree.notes.insert(id, Note { position, text });
+                        let position = project.tree.notes.get(&id).map_or_else(
+                            || {
+                                [
+                                    (canvas[2] * 0.5 - view.pan[0]) / view.zoom - 115.0,
+                                    (canvas[3] * 0.5 - view.pan[1]) / view.zoom,
+                                ]
+                            },
+                            |note| note.position,
+                        );
+                        project.tree.notes.insert(
+                            id,
+                            Note {
+                                node,
+                                position,
+                                text,
+                            },
+                        );
                     });
                     self.tool = Tool::Select;
                 }
@@ -393,7 +564,9 @@ impl State {
         self.edit(|p| {
             for id in selected {
                 let page = p.tree.pages.get_mut(&id).unwrap();
-                page.rotation = (page.rotation + 1) % 4;
+                if page.text.is_none() {
+                    page.rotation = (page.rotation + 1) % 4;
+                }
             }
         });
     }
@@ -409,12 +582,43 @@ impl State {
     }
 
     fn zoom(&mut self, factor: f32, point: [f32; 2]) {
-        let next = (self.view.zoom * factor).clamp(0.25, 4.0);
+        let next = (self.view.zoom * factor).clamp(store::MIN_ZOOM, store::MAX_ZOOM);
         let ratio = next / self.view.zoom;
         for (pan, point) in self.view.pan.iter_mut().zip(point) {
             *pan = point + (*pan - point) * ratio;
         }
         self.view.zoom = next;
+    }
+
+    fn toggle_graph(&mut self) {
+        self.graph_mode = !self.graph_mode;
+        self.selection = None;
+        if self.graph_mode && self.tool == Tool::Highlight {
+            self.tool = Tool::Select;
+        }
+        self.status.clear();
+    }
+
+    fn slide_title(&self, page: (Id, u32)) -> Option<String> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(title) = cache.titles.get(&page) {
+            return title.clone();
+        }
+        if cache.pending_titles.len() < 6
+            && !cache.pending_titles.contains(&page)
+            && let Some(bytes) = self.project.sources.get(&page.0)
+            && self
+                .jobs
+                .send(Job::Title {
+                    page,
+                    bytes: bytes.clone(),
+                    generation: self.generation,
+                })
+                .is_ok()
+        {
+            cache.pending_titles.insert(page);
+        }
+        None
     }
 
     fn preview(&self, key: PreviewKey) -> Option<Result<(rune::Pixels, Vec<Rect>), String>> {
@@ -543,6 +747,27 @@ fn worker(receiver: mpsc::Receiver<Job>, handle: AppHandle<State>) {
                     }
                 });
             }
+            Job::Title {
+                page,
+                bytes,
+                generation,
+            } => {
+                let title = (|| {
+                    if !document.as_ref().is_some_and(|doc| doc.matches(&bytes)) {
+                        document = Some(pdf::Document::open(bytes)?);
+                    }
+                    document.as_ref().unwrap().title(page.1)
+                })()
+                .ok()
+                .flatten();
+                handle.update(move |s, _| {
+                    if s.generation == generation {
+                        let cache = s.cache.get_mut();
+                        cache.pending_titles.remove(&page);
+                        cache.titles.insert(page, title);
+                    }
+                });
+            }
             Job::Render {
                 key,
                 bytes,
@@ -597,17 +822,47 @@ fn key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     }
     match event.key {
         Key::Command('s') => s.save(tx, None),
+        Key::Text(ref text)
+            if !event.mods.ctrl && !event.mods.cmd && !event.mods.alt && !event.mods.logo =>
+        {
+            match text.as_str() {
+                "h" | "H" if !s.graph_mode => s.set_tool(Tool::Highlight),
+                "s" | "S" => s.set_tool(Tool::Select),
+                "p" | "P" => s.set_tool(Tool::Hand),
+                "t" | "T" => s.set_tool(Tool::Note),
+                "v" | "V" => s.toggle_reposition(),
+                "r" | "R" => s.rotate(),
+                "c" | "C" => s.highlight_color_picker(),
+                "m" | "M" => {
+                    let node = s
+                        .anchor
+                        .filter(|id| s.selected.contains(id) && s.selected.len() == 1);
+                    s.note_editor(None, node);
+                }
+                "n" | "N" => s.text_node_editor(None),
+                _ => return false,
+            }
+        }
+        Key::Command('g') => s.toggle_graph(),
+        Key::Command('o') if event.mods.shift => s.request(Next::OpenPdf, tx),
         Key::Command('o') => s.request(Next::OpenProject, tx),
         Key::Command('q' | 'w') => s.request(Next::Quit, tx),
         Key::Command('z') => s.history(event.mods.shift),
         Key::Command('y') => s.history(true),
         Key::Command('d') => s.duplicate(),
+        Key::Command('b') => s.add_blank_page(),
+        Key::Command('i') => s.pick_pdf(Import::Add, tx),
+        Key::Command('r') => s.replace_page(tx),
+        Key::Command('u') => s.group_editor(),
+        Key::Command('+' | '=') => s.zoom_center(1.25),
+        Key::Command('-') => s.zoom_center(0.8),
+        Key::Command('0') => s.view = Viewport::default(),
         Key::Delete => s.remove(),
         Key::Escape => {
             s.drag = None;
+            s.reposition = None;
             s.drop = None;
             s.selection = None;
-            s.note_drag = None;
         }
         _ => return false,
     }
@@ -619,12 +874,12 @@ fn empty_state() -> State {
 }
 
 fn main() {
-    let app = App::new(AppSpec::new(
-        "PDF Tree",
-        (1100.0, 760.0),
-        empty_state,
-        ui::view,
-    ))
+    let app = App::new(AppSpec {
+        on_key: Some(key),
+        fonts: &[include_bytes!("../assets/JetBrainsMono.ttf")],
+        families: ("JetBrains Mono", "JetBrains Mono"),
+        ..AppSpec::new("PDF Tree", (1100.0, 760.0), empty_state, ui::view)
+    })
     .window_options(rune::WindowOptions {
         min_size: Some((860.0, 440.0)),
         ..Default::default()
@@ -734,19 +989,34 @@ mod tests {
         let root = project
             .tree
             .add(Page::new(Some((source, 0)), [200.0, 100.0]));
-        project.tree.pages.get_mut(&root).unwrap().highlights = vec![[0.1, 0.2, 0.3, 0.4]];
+        project.tree.pages.get_mut(&root).unwrap().highlights = vec![
+            Highlight::Legacy([0.1, 0.2, 0.3, 0.4]),
+            Highlight::Colored {
+                rect: [0.2, 0.3, 0.4, 0.5],
+                color: HighlightColor::Pink,
+            },
+        ];
+        project.tree.pages.get_mut(&root).unwrap().group = Some(3);
+        let child = project
+            .tree
+            .append_child(root, Page::new(None, [200.0, 100.0]));
+        project.tree.pages.get_mut(&child).unwrap().branch_position = Some(BranchPosition {
+            parent: root,
+            offset: [340.0, -180.0],
+        });
         project.tree.duplicate(&BTreeSet::from([root]));
         let note = project.tree.id();
         project.tree.notes.insert(
             note,
             Note {
                 text: "Study".into(),
+                node: Some(root),
                 position: [510.0, 45.0],
             },
         );
         let view = Viewport {
             pan: [5.0, -20.0],
-            zoom: 1.25,
+            zoom: store::MIN_ZOOM,
         };
         store::save(&path, &project, view).unwrap();
         let (reopened, restored) = store::load(&path).unwrap();
@@ -771,7 +1041,7 @@ mod tests {
             empty_state,
             ui::view,
         ));
-        rune::Runtime::new(
+        let mut runtime = rune::Runtime::new(
             State::new(app.handle()),
             ui::view,
             (1100.0, 760.0),
@@ -779,7 +1049,9 @@ mod tests {
                 system_dark: true,
                 scale: 1.0,
             },
-        )
+        );
+        runtime.on_key = Some(key);
+        runtime
     }
 
     #[test]
@@ -810,6 +1082,109 @@ mod tests {
             Some((rune::FileDialogKind::Open, _))
         ));
         rt.resolve_file_dialog(None).unwrap();
+    }
+
+    #[test]
+    fn right_click_selects_the_imported_chain_tail_and_drag_moves_it() {
+        let mut rt = runtime();
+        rt.state.import_pages(
+            Import::Open,
+            fixture(0, ""),
+            &[[200.0, 100.0]; 4],
+            vec![0; 4],
+        );
+        let order = rt.state.project.tree.order();
+        let [a, b, c, d] = std::array::from_fn(|i| order[i].0);
+        assert_eq!(rt.state.project.tree.roots, [a]);
+        assert_eq!(
+            order.iter().map(|row| row.2).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        rt.frame(0.0);
+        let on = rt.find(&format!("page-header-{c}")).unwrap();
+        rt.secondary_down(on.0, on.1);
+        rt.secondary_up(on.0, on.1);
+        rt.frame(0.0);
+        assert_eq!(rt.state.selected, BTreeSet::from([c, d]));
+        let start = rt.find(&format!("page-header-{c}")).unwrap();
+        let end = rt.find(&format!("page-header-{a}")).unwrap();
+        rt.pointer_down(start.0, start.1);
+        rt.frame(0.0);
+        rt.pointer_move(end.0, end.1);
+        rt.frame(0.0);
+        rt.pointer_up(end.0, end.1);
+        rt.frame(0.0);
+        assert_eq!(rt.state.project.tree.pages[&a].children, [b, c]);
+        assert!(rt.state.project.tree.pages[&b].children.is_empty());
+        assert_eq!(rt.state.project.tree.pages[&c].children, [d]);
+    }
+
+    #[test]
+    fn text_node_can_be_edited_moved_and_undone() {
+        let mut rt = runtime();
+        let root = rt.state.project.tree.add(Page::new(None, [200.0, 100.0]));
+        rt.state.text_node_editor(None);
+        rt.state.draft = TextEdit::new("A branch title");
+        rt.state.apply_prompt();
+        let id = *rt.state.selected.first().unwrap();
+        assert_eq!(
+            rt.state.project.tree.pages[&id].text.as_deref(),
+            Some("A branch title")
+        );
+        rt.state.edit(|p| {
+            p.tree
+                .move_pages(&BTreeSet::from([id]), Destination::Child(root))
+        });
+        rt.state.text_node_editor(Some(id));
+        rt.state.draft = TextEdit::new("Revised");
+        rt.state.apply_prompt();
+        assert_eq!(rt.state.project.tree.pages[&root].children, [id]);
+        rt.state.history(false);
+        assert_eq!(
+            rt.state.project.tree.pages[&id].text.as_deref(),
+            Some("A branch title")
+        );
+        let saved = serde_json::to_string(&rt.state.project.tree).unwrap();
+        let loaded: model::Tree = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded, rt.state.project.tree);
+    }
+
+    #[test]
+    fn root_drop_reveals_moved_pages_after_a_long_sequence() {
+        let mut rt = runtime();
+        let pages: [Id; 12] =
+            std::array::from_fn(|_| rt.state.project.tree.add(Page::new(None, [200.0, 100.0])));
+        let [parent, a, b, descendant, ..] = pages;
+        let selected = BTreeSet::from([a, b]);
+        rt.state
+            .project
+            .tree
+            .move_pages(&selected, Destination::Child(parent));
+        rt.state
+            .project
+            .tree
+            .move_pages(&BTreeSet::from([descendant]), Destination::Child(b));
+        rt.state.selected = selected;
+        rt.state.view.pan[0] = 220.0;
+        rt.frame(0.0);
+        let start = rt.find(&format!("page-header-{a}")).unwrap();
+        rt.pointer_down(start.0, start.1);
+        rt.frame(0.0);
+        let end = rt.find("move-to-root").unwrap();
+        rt.pointer_move(end.0, end.1);
+        rt.frame(0.0);
+        assert_eq!(rt.state.drop, Some(Destination::Root));
+        rt.pointer_up(end.0, end.1);
+        rt.frame(0.0);
+        assert_eq!(&rt.state.project.tree.roots[9..], &[a, b]);
+        assert_eq!(rt.state.project.tree.pages[&b].children, [descendant]);
+        assert!(rt.state.project.tree.pages[&parent].children.is_empty());
+        for id in [a, b] {
+            let (x, y) = rt.find(&format!("page-header-{id}")).unwrap();
+            let [left, top, width, height] = rt.state.canvas;
+            assert!((left..left + width).contains(&x));
+            assert!((top..top + height).contains(&y));
+        }
     }
 
     #[test]
@@ -844,6 +1219,7 @@ mod tests {
             }),
         );
         rt.state.tool = Tool::Highlight;
+        rt.state.highlight_color = HighlightColor::Blue;
         rt.frame(0.0);
         let center = rt.find(&format!("page-image-{id}")).unwrap();
         let point = |[x, y, w, h]: Rect| {
@@ -861,8 +1237,144 @@ mod tests {
         rt.pointer_up(end.0, end.1);
         rt.frame(0.0);
         let highlights = &rt.state.project.tree.pages[&id].highlights;
-        assert_eq!(highlights.first(), Some(&first));
-        assert_eq!(highlights.last(), Some(&last));
+        assert_eq!(
+            highlights.first().unwrap().parts(),
+            (first, HighlightColor::Blue)
+        );
+        assert_eq!(
+            highlights.last().unwrap().parts(),
+            (last, HighlightColor::Blue)
+        );
+    }
+
+    #[test]
+    fn graph_switch_replaces_pdf_preview_with_a_title_card() {
+        let mut rt = runtime();
+        let bytes = fixture(0, "BT /F1 12 Tf 20 70 Td (Slide title) Tj ET");
+        let title = pdf::Document::open(bytes.clone())
+            .unwrap()
+            .title(0)
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Slide title"));
+        let source = rt.state.project.source(bytes);
+        let id = rt
+            .state
+            .project
+            .tree
+            .add(Page::new(Some((source, 0)), [200.0, 100.0]));
+        rt.state.cache.get_mut().titles.insert((source, 0), title);
+        rt.frame(0.0);
+        let switch = rt.find("graph-mode").unwrap();
+        assert!(rt.find(&format!("page-image-{id}")).is_some());
+
+        rt.pointer_down(switch.0, switch.1);
+        rt.pointer_up(switch.0, switch.1);
+        rt.frame(0.0);
+        assert!(rt.state.graph_mode);
+        assert!(rt.find(&format!("page-image-{id}")).is_none());
+        assert!(rt.find(&format!("text-node-body-{id}")).is_some());
+
+        rt.key(rune::KeyEvent {
+            key: Key::Command('g'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.0);
+        assert!(!rt.state.graph_mode);
+        assert!(rt.find(&format!("page-image-{id}")).is_some());
+    }
+
+    #[test]
+    fn toolbar_shows_shortcuts_on_hover() {
+        let mut rt = runtime();
+        rt.frame(0.0);
+
+        for (id, title, shortcut) in [
+            ("graph-mode", "Toggle Graph mode", "G"),
+            ("reposition", "Reposition", "V"),
+            ("duplicate", "Duplicate", "D"),
+        ] {
+            let point = rt.find(id).unwrap();
+            rt.pointer_move(point.0, point.1);
+            rt.frame(0.0);
+            rt.frame(rt.help_delay + 0.1);
+            let (tip, _) = rt.help_tooltip().unwrap();
+            assert!(tip.starts_with(title) && tip.ends_with(shortcut), "{tip}");
+        }
+    }
+
+    #[test]
+    fn reposition_moves_a_soft_subtree_and_undo_restores_layout() {
+        let mut rt = runtime();
+        let tree = &mut rt.state.project.tree;
+        let page = || Page::new(None, [200.0, 100.0]);
+        let root = tree.add(page());
+        let branch = tree.append_child(root, page());
+        rt.state.set_tool(Tool::Reposition);
+        rt.frame(0.0);
+        let header = format!("page-header-{branch}");
+        let start = rt.find(&header).unwrap();
+        rt.pointer_down(start.0, start.1);
+        rt.pointer_move(start.0 + 60.0, start.1 - 30.0);
+        rt.frame(0.0);
+        rt.pointer_up(start.0 + 60.0, start.1 - 30.0);
+        rt.frame(0.0);
+        let end = rt.find(&header).unwrap();
+        assert_eq!((end.0 - start.0, end.1 - start.1), (60.0, -30.0));
+        assert_eq!(
+            rt.state.project.tree.pages[&branch]
+                .branch_position
+                .unwrap()
+                .parent,
+            root
+        );
+        rt.update(|s, _| s.history(false));
+        assert!(
+            rt.state.project.tree.pages[&branch]
+                .branch_position
+                .is_none()
+        );
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let restored = rt.find(&header).unwrap();
+        assert!((restored.0 - start.0).abs() < 0.5);
+        assert!((restored.1 - start.1).abs() < 0.5);
+    }
+
+    #[test]
+    fn letter_shortcuts_open_editors_and_preserve_text_input() {
+        let mut rt = runtime();
+        rt.frame(0.0);
+        let press = |text: &str| rune::KeyEvent {
+            key: Key::Text(text.into()),
+            mods: Default::default(),
+        };
+        rt.key(press("H"));
+        rt.frame(0.0);
+        assert!(rt.state.tool == Tool::Highlight);
+        rt.key(press("s"));
+        rt.frame(0.0);
+        assert!(rt.state.tool == Tool::Select);
+        rt.key(press("M"));
+        rt.frame(0.0);
+        assert!(matches!(
+            rt.state.prompt,
+            Some(Prompt::Note { id: None, .. })
+        ));
+        rt.update(|s, _| s.prompt = None);
+        rt.frame(0.0);
+        rt.key(press("n"));
+        rt.frame(0.0);
+        assert!(matches!(rt.state.prompt, Some(Prompt::TextNode(None))));
+        rt.frame(0.0);
+        rt.key(press("h"));
+        rt.frame(0.0);
+        assert!(matches!(rt.state.prompt, Some(Prompt::TextNode(None))));
+        assert!(rt.state.tool == Tool::Select);
+        assert_eq!(rt.state.draft.text, "h");
     }
 
     #[test]

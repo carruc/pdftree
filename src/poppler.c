@@ -20,6 +20,10 @@ PopplerPage *pdf_page(PopplerDocument *doc, int index, double *size) {
     return page;
 }
 
+char *pdf_page_text(PopplerPage *page) {
+    return poppler_page_get_text(page);
+}
+
 PopplerRectangle *pdf_text(PopplerPage *page, unsigned *count) {
     PopplerRectangle *rects = NULL;
     *count = 0;

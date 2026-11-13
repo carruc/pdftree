@@ -5,12 +5,64 @@ use std::sync::Arc;
 pub type Id = u64;
 pub type Rect = [f32; 4];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HighlightColor {
+    Gray,
+    #[default]
+    Yellow,
+    Green,
+    Blue,
+    Pink,
+    Orange,
+}
+
+impl HighlightColor {
+    pub fn style(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Gray => ("Gray", "#777777"),
+            Self::Yellow => ("Yellow", "#ffcf26"),
+            Self::Green => ("Green", "#48c96d"),
+            Self::Blue => ("Blue", "#43a7ff"),
+            Self::Pink => ("Pink", "#f773bc"),
+            Self::Orange => ("Orange", "#ff913f"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Highlight {
+    Legacy(Rect),
+    Colored { rect: Rect, color: HighlightColor },
+}
+
+impl Highlight {
+    pub fn parts(self) -> (Rect, HighlightColor) {
+        match self {
+            Self::Legacy(rect) => (rect, HighlightColor::Gray),
+            Self::Colored { rect, color } => (rect, color),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BranchPosition {
+    pub parent: Id,
+    pub offset: [f32; 2],
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     pub source: Option<(Id, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_position: Option<BranchPosition>,
     pub size: [f32; 2],
     pub rotation: u8,
-    pub highlights: Vec<Rect>,
+    pub highlights: Vec<Highlight>,
     pub children: Vec<Id>,
 }
 
@@ -18,6 +70,9 @@ impl Page {
     pub fn new(source: Option<(Id, u32)>, size: [f32; 2]) -> Self {
         Self {
             source,
+            text: None,
+            group: None,
+            branch_position: None,
             size,
             rotation: 0,
             highlights: vec![],
@@ -28,6 +83,8 @@ impl Page {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Note {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<Id>,
     pub position: [f32; 2],
     pub text: String,
 }
@@ -72,12 +129,16 @@ impl Project {
                 return false;
             };
             if page.rotation > 3
+                || page.group.is_some_and(|color| color >= 12)
+                || page
+                    .branch_position
+                    .is_some_and(|position| !position.offset.iter().all(|v| v.is_finite()))
                 || !page.size.iter().all(|v| v.is_finite() && *v > 0.0)
                 || page
                     .highlights
                     .iter()
-                    .flatten()
-                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    .flat_map(|highlight| highlight.parts().0)
+                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
                 || page
                     .source
                     .is_some_and(|(s, _)| !self.sources.contains_key(&s))
@@ -89,7 +150,10 @@ impl Project {
         tree.next < i64::MAX as u64
             && seen.len() == tree.pages.len()
             && tree.notes.iter().all(|(&id, note)| {
-                id > 0 && id <= tree.next && note.position.iter().all(|v| v.is_finite())
+                id > 0
+                    && id <= tree.next
+                    && note.node.is_none_or(|node| seen.contains(&node))
+                    && note.position.iter().all(|v| v.is_finite())
             })
             && self.sources.keys().all(|&id| {
                 id > 0 && id <= tree.next && !seen.contains(&id) && !tree.notes.contains_key(&id)
@@ -140,6 +204,23 @@ impl Tree {
         id
     }
 
+    pub fn append_child(&mut self, parent: Id, page: Page) -> Id {
+        let id = self.id();
+        self.pages.insert(id, page);
+        self.siblings(Some(parent)).push(id);
+        id
+    }
+
+    pub fn descendants(&self, id: Id) -> BTreeSet<Id> {
+        let mut selected = BTreeSet::new();
+        let mut pending = self.pages[&id].children.clone();
+        while let Some(child) = pending.pop() {
+            selected.insert(child);
+            pending.extend(&self.pages[&child].children);
+        }
+        selected
+    }
+
     pub fn duplicate(&mut self, selected: &BTreeSet<Id>) {
         for (id, parent, _) in self.order() {
             if !selected.contains(&id) {
@@ -161,6 +242,10 @@ impl Tree {
                 continue;
             }
             let page = self.pages.remove(&id).unwrap();
+            for child in &page.children {
+                self.pages.get_mut(child).unwrap().branch_position = None;
+            }
+            self.notes.retain(|_, note| note.node != Some(id));
             let siblings = self.siblings(parent);
             let index = siblings.iter().position(|&sibling| sibling == id).unwrap();
             siblings.splice(index..=index, page.children);
@@ -208,6 +293,9 @@ impl Tree {
             let siblings = self.siblings(from);
             let index = siblings.iter().position(|&sibling| sibling == id).unwrap();
             siblings.remove(index);
+            if from != parent {
+                self.pages.get_mut(&id).unwrap().branch_position = None;
+            }
         }
         let siblings = self.siblings(parent);
         let index = match drop {

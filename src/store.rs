@@ -1,7 +1,16 @@
 use crate::model::{Id, Project, Tree};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, path::Path, sync::Arc};
+use std::{
+    error::Error,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+pub const MIN_ZOOM: f32 = 0.08;
+pub const MAX_ZOOM: f32 = 4.0;
 
 const APPLICATION_ID: i64 = 0x50545245;
 
@@ -90,10 +99,56 @@ pub fn load(path: &Path) -> Result<(Project, Viewport)> {
     };
     let view: Viewport = serde_json::from_str(&view)?;
     if !project.validate()
-        || !(0.25..=4.0).contains(&view.zoom)
+        || !(MIN_ZOOM..=MAX_ZOOM).contains(&view.zoom)
         || view.pan.iter().any(|v| !v.is_finite())
     {
         return Err("The project contains invalid data.".into());
     }
     Ok((project, view))
+}
+
+pub const RECENT_LIMIT: usize = 6;
+
+fn recent_path() -> Option<PathBuf> {
+    let config = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::home_dir().map(|home| home.join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| std::env::home_dir().map(|home| home.join(".config")))
+    }?;
+    Some(config.join("pdf-tree").join("recent-projects.json"))
+}
+
+pub fn recent_projects() -> Vec<PathBuf> {
+    recent_path()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Vec<PathBuf>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| path.is_file())
+        .take(RECENT_LIMIT)
+        .collect()
+}
+
+pub fn save_recent_projects(paths: &[PathBuf]) -> Result<()> {
+    let Some(path) = recent_path() else {
+        return Ok(());
+    };
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir)?;
+    let temp = dir.join(format!("recent-projects.{}.tmp", std::process::id()));
+    let write = || -> Result<()> {
+        fs::File::create(&temp)?.write_all(&serde_json::to_vec(paths)?)?;
+        fs::rename(&temp, &path)?;
+        Ok(())
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
 }
