@@ -105,6 +105,7 @@ struct State {
     status: String,
     generation: u64,
     importing: bool,
+    choosing_file: bool,
     cache: RefCell<Cache>,
     jobs: mpsc::Sender<Job>,
     app: AppHandle<Self>,
@@ -136,6 +137,7 @@ impl State {
             status: String::new(),
             generation: 0,
             importing: false,
+            choosing_file: false,
             cache: RefCell::new(Cache {
                 pending: BTreeSet::new(),
                 entries: BTreeMap::new(),
@@ -210,18 +212,22 @@ impl State {
             Next::Quit => tx.quit(),
             Next::OpenPdf => self.pick_pdf(Import::Open, tx),
             Next::OpenProject => {
+                self.choosing_file = true;
                 tx.open_file(
                     dialog("Open project", EXTENSION),
-                    |s: &mut Self, answer, _| match answer {
-                        Ok(Some(path)) => match store::load(&path) {
-                            Ok((project, view)) => {
-                                s.reset(project, Some(path), view);
-                                s.status = "Project opened.".into();
-                            }
+                    |s: &mut Self, answer, _| {
+                        s.choosing_file = false;
+                        match answer {
+                            Ok(Some(path)) => match store::load(&path) {
+                                Ok((project, view)) => {
+                                    s.reset(project, Some(path), view);
+                                    s.status = "Project opened.".into();
+                                }
+                                Err(error) => s.status = error.to_string(),
+                            },
+                            Ok(None) => {}
                             Err(error) => s.status = error.to_string(),
-                        },
-                        Ok(None) => {}
-                        Err(error) => s.status = error.to_string(),
+                        }
                     },
                 );
             }
@@ -234,15 +240,19 @@ impl State {
         } else {
             let mut options = dialog("Save project", EXTENSION);
             options.file_name = Some(format!("Untitled.{EXTENSION}"));
-            tx.save_file(options, move |s: &mut Self, answer, tx| match answer {
-                Ok(Some(mut path)) => {
-                    if path.extension().is_none() {
-                        path.set_extension(EXTENSION);
+            self.choosing_file = true;
+            tx.save_file(options, move |s: &mut Self, answer, tx| {
+                s.choosing_file = false;
+                match answer {
+                    Ok(Some(mut path)) => {
+                        if path.extension().is_none() {
+                            path.set_extension(EXTENSION);
+                        }
+                        s.save_to(path, tx, next);
                     }
-                    s.save_to(path, tx, next);
+                    Ok(None) => {}
+                    Err(error) => s.status = error.to_string(),
                 }
-                Ok(None) => {}
-                Err(error) => s.status = error.to_string(),
             });
         }
     }
@@ -262,12 +272,16 @@ impl State {
     }
 
     fn pick_pdf(&mut self, action: Import, tx: &mut Tx) {
+        self.choosing_file = true;
         tx.open_file(
             dialog("Choose a PDF", "pdf"),
-            move |s: &mut Self, answer, _| match answer {
-                Ok(Some(path)) => s.read_pdf(path, action),
-                Ok(None) => {}
-                Err(error) => s.status = error.to_string(),
+            move |s: &mut Self, answer, _| {
+                s.choosing_file = false;
+                match answer {
+                    Ok(Some(path)) => s.read_pdf(path, action),
+                    Ok(None) => {}
+                    Err(error) => s.status = error.to_string(),
+                }
             },
         );
     }
@@ -332,6 +346,7 @@ impl State {
     }
 
     fn note_editor(&mut self, id: Option<Id>, position: [f32; 2]) {
+        self.status.clear();
         self.draft = TextEdit::new(id.map_or("", |id| &self.project.tree.notes[&id].text));
         self.prompt = Some(Prompt::Note { id, position });
     }
@@ -577,7 +592,7 @@ fn key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
         }
         return false;
     }
-    if s.importing {
+    if s.importing || s.choosing_file {
         return false;
     }
     match event.key {

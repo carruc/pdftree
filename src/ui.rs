@@ -508,6 +508,9 @@ fn workspace(s: &State, p: &Palette, scale: f32) -> El {
                 }
             });
     }
+    if s.choosing_file || s.importing {
+        background = background.disabled(true);
+    }
     let mut board = el()
         .key("canvas")
         .w_full()
@@ -549,7 +552,10 @@ fn workspace(s: &State, p: &Palette, scale: f32) -> El {
                 })),
         );
     }
-    for card in cards.iter().filter(|c| visible(c.rect, s.canvas)) {
+    for card in cards
+        .iter()
+        .filter(|c| visible(c.rect, s.canvas) || s.drag == Some(c.id))
+    {
         board = board.child(card_view(s, card, p, scale));
         if s.drop == Some(Destination::Before(card.id)) {
             let [x, y, w, _] = card.rect;
@@ -574,6 +580,15 @@ fn workspace(s: &State, p: &Palette, scale: f32) -> El {
                 .fill(p.accent_bg)
                 .border(if active { 2.0 } else { 1.0 }, p.accent)
                 .child(label("Move to root", 12.0, 650.0, p.accent)),
+        );
+    }
+    if s.choosing_file || s.importing {
+        board = board.child(
+            el().key("busy-layer")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .on_press(|_: &mut State| {}),
         );
     }
     board
@@ -684,7 +699,7 @@ fn prompt(s: &State, p: &Palette, modal: &Prompt) -> El {
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = Palette::new();
-    let ready = !s.importing && s.prompt.is_none();
+    let ready = !s.importing && !s.choosing_file && s.prompt.is_none();
     let selected = !s.selected.is_empty();
     let dirty = s.saved != s.project;
     let title = s
@@ -831,7 +846,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(workspace(s, &p, cx.env().scale))
         .child(footer)
         .on_drop_files(|s: &mut State, files, _| {
-            if s.importing || s.prompt.is_some() {
+            if s.importing || s.choosing_file || s.prompt.is_some() {
                 return;
             }
             if let Some(path) = files.into_iter().find(|path| {
